@@ -1,0 +1,45 @@
+name: intelligent_scheduler
+description: Context-Aware Intelligent Scheduler using Inductive Reasoning and Reinforcement Learning
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  
+  # State Management
+  flutter_riverpod: ^2.4.9
+  
+  # Network & API
+  http: ^1.1.2
+  
+  # UI Components
+  cupertino_icons: ^1.0.2
+  timeline_tile: ^2.0.0
+  intl: ^0.18.1
+  
+  # Notifications
+  flutter_local_notifications: ^17.0.0
+  
+  # Google Calendar Integration
+  googleapis: ^13.0.0
+  googleapis_auth: ^1.6.0
+  google_sign_in: ^6.2.1
+  
+  # Shared Preferences for tracking feedback state
+  shared_preferences: ^2.2.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+
+  # Add assets
+  # assets:
+  #   - assets/images/
