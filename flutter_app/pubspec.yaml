@@ -31,6 +31,9 @@ dependencies:
   
   # Shared Preferences for tracking feedback state
   shared_preferences: ^2.2.2
+  
+  # Background execution for continuous notifications
+  workmanager: ^0.9.0
 
 dev_dependencies:
   flutter_test:

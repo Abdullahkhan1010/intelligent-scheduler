@@ -4,7 +4,7 @@ FastAPI Main Application - Context-Aware Intelligent Scheduler
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List
 
 from models import (
@@ -19,9 +19,20 @@ from models import (
     InferenceResponse,
     ChatInputSchema,
     ChatResponse,
-    InferredTask
+    InferredTask,
+    NotificationDecisionRequest,
+    NotificationDecisionResponse,
+    ParsedTaskRequest,
+    ParsedTaskResponse,
+    TaskCreationRequest,
+    CalendarEventSchema,
+    CalendarSyncRequest,
+    CalendarSyncResponse,
+    CalendarEventDB
 )
 from inference import InferenceEngine, NaturalLanguageParser
+from learning_service import LearningService
+from calendar_parser import parse_calendar_event
 
 app = FastAPI(
     title="Context-Aware Intelligent Scheduler",
@@ -266,6 +277,289 @@ def chat_input(chat: ChatInputSchema, db: Session = Depends(get_db)):
         )
 
 
+@app.post("/parse-task", response_model=ParsedTaskResponse)
+def parse_task(request: ParsedTaskRequest, db: Session = Depends(get_db)):
+    """
+    Parse natural language into structured task with confidence scoring.
+    Returns parsed details without creating the task yet.
+    
+    Example: "Remind me to call mom at 6 PM tomorrow"
+    Returns: Structured task with confidence scores for each field
+    """
+    parser = NaturalLanguageParser(db)
+    
+    try:
+        result = parser.parse_with_confidence(request.user_input, request.current_context)
+        
+        return ParsedTaskResponse(**result)
+    
+    except Exception as e:
+        return ParsedTaskResponse(
+            success=False,
+            confidence=0.0,
+            parsed_task_name=None,
+            parsed_description=request.user_input,
+            extraction_details={"error": str(e)},
+            confidence_breakdown={},
+            requires_confirmation=True,
+            suggestions=["Could you rephrase that?"],
+            original_input=request.user_input
+        )
+
+
+@app.post("/create-task", response_model=TaskRuleResponse)
+def create_task(request: TaskCreationRequest, db: Session = Depends(get_db)):
+    """
+    Create a confirmed task from structured data.
+    This is called after user confirms the parsed task details.
+    """
+    try:
+        # Build trigger conditions
+        trigger_condition = request.trigger_conditions or {}
+        
+        if request.location_context:
+            trigger_condition["location_vector"] = request.location_context
+        
+        if request.scheduled_time:
+            hour = request.scheduled_time.hour
+            start_hour = max(0, hour - 1)
+            end_hour = min(23, hour + 1)
+            trigger_condition["time_range"] = f"{start_hour:02d}:00-{end_hour:02d}:00"
+        
+        # Determine initial probability weight based on priority
+        priority_weights = {
+            "high": 0.85,
+            "medium": 0.75,
+            "low": 0.65
+        }
+        initial_weight = priority_weights.get(request.priority, 0.75)
+        
+        # Create task rule
+        new_rule = TaskRuleDB(
+            task_name=request.task_name,
+            task_description=request.task_description,
+            trigger_condition=trigger_condition,
+            current_probability_weight=initial_weight,
+            is_active=1
+        )
+        
+        db.add(new_rule)
+        db.commit()
+        db.refresh(new_rule)
+        
+        return TaskRuleResponse(
+            id=new_rule.id,
+            task_name=new_rule.task_name,
+            task_description=new_rule.task_description,
+            trigger_condition=new_rule.trigger_condition,
+            current_probability_weight=new_rule.current_probability_weight,
+            is_active=bool(new_rule.is_active),
+            created_at=new_rule.created_at,
+            updated_at=new_rule.updated_at
+        )
+    
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to create task: {str(e)}"
+        )
+
+
+# ===================== CALENDAR INTEGRATION =====================
+
+@app.post("/calendar/sync", response_model=CalendarSyncResponse)
+def sync_calendar_events(request: CalendarSyncRequest, db: Session = Depends(get_db)):
+    """
+    Sync calendar events from Google Calendar.
+    Parses events, extracts priority and timing metadata, stores them,
+    and creates task rules for intelligent reminders.
+    """
+    events_created = 0
+    events_updated = 0
+    tasks_generated = 0
+    
+    for event_data in request.events:
+        try:
+            # Convert to dict format expected by calendar_parser
+            event_dict = {
+                'id': event_data.event_id,
+                'summary': event_data.summary,
+                'description': event_data.description,
+                'location': event_data.location,
+                'start': {
+                    'dateTime': event_data.start_time.isoformat() if event_data.start_time else None,
+                    'date': event_data.start_time.date().isoformat() if event_data.is_all_day and event_data.start_time else None
+                } if event_data.start_time else {},
+                'end': {
+                    'dateTime': event_data.end_time.isoformat() if event_data.end_time else None,
+                    'date': event_data.end_time.date().isoformat() if event_data.is_all_day and event_data.end_time else None
+                } if event_data.end_time else {},
+                'attendees': event_data.attendees or [],
+                'recurrence': event_data.recurrence,
+                'recurringEventId': event_data.recurring_event_id
+            }
+            
+            # Parse event using calendar_parser
+            parsed_task = parse_calendar_event(event_dict)
+            
+            # Check if event already exists
+            existing_event = db.query(CalendarEventDB).filter(
+                CalendarEventDB.event_id == parsed_task.event_id
+            ).first()
+            
+            if existing_event:
+                # Update existing event
+                existing_event.title = parsed_task.title
+                existing_event.description = parsed_task.description
+                existing_event.start_time = parsed_task.start_time
+                existing_event.end_time = parsed_task.end_time
+                existing_event.is_all_day = int(parsed_task.is_all_day)
+                existing_event.task_type = parsed_task.task_type.value
+                existing_event.priority = parsed_task.priority.value
+                existing_event.time_critical = int(parsed_task.time_critical)
+                existing_event.location = parsed_task.location
+                existing_event.location_category = parsed_task.location_category
+                existing_event.preparation_time_minutes = parsed_task.preparation_time_minutes
+                existing_event.travel_time_minutes = parsed_task.travel_time_minutes
+                existing_event.optimal_reminder_time = parsed_task.get_optimal_reminder_time()
+                existing_event.is_recurring = int(parsed_task.is_recurring)
+                existing_event.recurrence_pattern = parsed_task.recurrence_pattern
+                existing_event.recurrence_id = parsed_task.recurrence_id
+                existing_event.suggested_contexts = parsed_task.suggested_contexts
+                existing_event.synced_at = datetime.utcnow()
+                existing_event.updated_at = datetime.utcnow()
+                events_updated += 1
+            else:
+                # Create new calendar event
+                new_event = CalendarEventDB(
+                    event_id=parsed_task.event_id,
+                    title=parsed_task.title,
+                    description=parsed_task.description,
+                    start_time=parsed_task.start_time,
+                    end_time=parsed_task.end_time,
+                    is_all_day=int(parsed_task.is_all_day),
+                    task_type=parsed_task.task_type.value,
+                    priority=parsed_task.priority.value,
+                    time_critical=int(parsed_task.time_critical),
+                    location=parsed_task.location,
+                    location_category=parsed_task.location_category,
+                    preparation_time_minutes=parsed_task.preparation_time_minutes,
+                    travel_time_minutes=parsed_task.travel_time_minutes,
+                    optimal_reminder_time=parsed_task.get_optimal_reminder_time(),
+                    is_recurring=int(parsed_task.is_recurring),
+                    recurrence_pattern=parsed_task.recurrence_pattern,
+                    recurrence_id=parsed_task.recurrence_id,
+                    suggested_contexts=parsed_task.suggested_contexts
+                )
+                db.add(new_event)
+                events_created += 1
+            
+            db.commit()
+            
+            # Create or update task rule for this calendar event
+            # Only create rules for events that need reminders
+            if parsed_task.start_time and not parsed_task.is_all_day:
+                # Check if rule already exists
+                existing_rule = db.query(TaskRuleDB).filter(
+                    TaskRuleDB.calendar_event_id == parsed_task.event_id
+                ).first()
+                
+                # Build trigger conditions based on event metadata
+                trigger_conditions = {
+                    'calendar_event': True,
+                    'priority': parsed_task.priority.value,
+                    'time_critical': parsed_task.time_critical
+                }
+                
+                # Add context suggestions
+                if parsed_task.suggested_contexts:
+                    trigger_conditions['contexts'] = parsed_task.suggested_contexts
+                
+                # Add location if specified
+                if parsed_task.location_category:
+                    trigger_conditions['location_category'] = parsed_task.location_category
+                
+                if existing_rule:
+                    # Update existing rule
+                    existing_rule.task_name = parsed_task.title
+                    existing_rule.task_description = parsed_task.description or parsed_task.title
+                    existing_rule.trigger_condition = trigger_conditions
+                    existing_rule.updated_at = datetime.utcnow()
+                else:
+                    # Create new rule with SAME Bayesian initial weights as chat tasks
+                    # This ensures calendar tasks participate in the same learning system
+                    priority_weights = {
+                        'high': 0.85,    # Same as chat high priority
+                        'medium': 0.75,  # Same as chat medium priority
+                        'low': 0.65      # Same as chat low priority
+                    }
+                    initial_weight = priority_weights.get(parsed_task.priority.value, 0.75)
+                    
+                    new_rule = TaskRuleDB(
+                        task_name=parsed_task.title,
+                        task_description=parsed_task.description or parsed_task.title,
+                        trigger_condition=trigger_conditions,
+                        current_probability_weight=initial_weight,
+                        calendar_event_id=parsed_task.event_id,
+                        is_active=1
+                    )
+                    db.add(new_rule)
+                    tasks_generated += 1
+                
+                db.commit()
+        
+        except Exception as e:
+            print(f"Error processing calendar event {event_data.event_id}: {e}")
+            continue
+    
+    return CalendarSyncResponse(
+        success=True,
+        events_processed=len(request.events),
+        events_created=events_created,
+        events_updated=events_updated,
+        tasks_generated=tasks_generated,
+        message=f"Successfully synced {len(request.events)} calendar events"
+    )
+
+
+@app.get("/calendar/upcoming")
+def get_upcoming_calendar_tasks(hours_ahead: int = 24, db: Session = Depends(get_db)):
+    """
+    Get upcoming calendar events that need reminders.
+    Returns events within the specified time window that haven't been completed or dismissed.
+    """
+    now = datetime.utcnow()
+    time_ahead = now + timedelta(hours=hours_ahead)
+    
+    upcoming_events = db.query(CalendarEventDB).filter(
+        CalendarEventDB.start_time != None,
+        CalendarEventDB.start_time >= now,
+        CalendarEventDB.start_time <= time_ahead,
+        CalendarEventDB.completed == 0,
+        CalendarEventDB.dismissed == 0
+    ).order_by(CalendarEventDB.start_time).all()
+    
+    return {
+        'success': True,
+        'count': len(upcoming_events),
+        'events': [
+            {
+                'event_id': event.event_id,
+                'title': event.title,
+                'description': event.description,
+                'start_time': event.start_time.isoformat() if event.start_time else None,
+                'end_time': event.end_time.isoformat() if event.end_time else None,
+                'priority': event.priority,
+                'location': event.location,
+                'optimal_reminder_time': event.optimal_reminder_time.isoformat() if event.optimal_reminder_time else None,
+                'preparation_time_minutes': event.preparation_time_minutes,
+                'travel_time_minutes': event.travel_time_minutes
+            }
+            for event in upcoming_events
+        ]
+    }
+
+
 # ===================== ANALYTICS & FEEDBACK HISTORY =====================
 
 @app.get("/feedback-history")
@@ -326,6 +620,258 @@ def rule_performance_analytics(db: Session = Depends(get_db)):
     analytics.sort(key=lambda x: x["acceptance_rate"], reverse=True)
     
     return {"analytics": analytics}
+
+
+# ===================== NOTIFICATION DECISION ENDPOINT =====================
+
+@app.post("/notification/decision", response_model=NotificationDecisionResponse)
+def decide_notification(
+    request: NotificationDecisionRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Deterministic notification decision endpoint using Bayesian inference.
+    
+    Algorithm:
+    1. Extract context features and generate context key
+    2. Query Beta distributions for all timing windows
+    3. Apply Upper Confidence Bound (UCB) for exploration/exploitation
+    4. Determine if current time aligns with optimal window
+    5. Return notification decision with confidence and explanation
+    
+    Stateless: No state changes, only reads from database.
+    Deterministic: Same input always produces same output.
+    """
+    from inference import BayesianTimingOptimizer
+    
+    # Initialize Bayesian optimizer
+    optimizer = BayesianTimingOptimizer(db)
+    
+    # Get optimal timing using Bayesian inference
+    timing_result = optimizer.get_optimal_timing(
+        task_type=request.task_type,
+        context=request.context
+    )
+    
+    optimal_window = timing_result['timing_window']
+    confidence = timing_result['confidence']
+    meets_threshold = timing_result['meets_threshold']
+    context_key = timing_result['context_key']
+    all_windows = timing_result['all_windows']
+    
+    # Decision logic: Notify now if confidence meets threshold
+    # For scheduled tasks, check if we're within the optimal window
+    notify_now = False
+    suggested_delay = None
+    
+    if request.task_scheduled_time:
+        # Fixed-time task: calculate minutes until task
+        time_until_task = (request.task_scheduled_time - datetime.utcnow()).total_seconds() / 60
+        
+        if time_until_task < 0:
+            # Task time has passed
+            notify_now = False
+            suggested_delay = None
+            decision_reason = "Task scheduled time has passed"
+        elif time_until_task <= optimal_window + 5:  # 5-minute tolerance
+            # We're within the optimal notification window
+            if meets_threshold:
+                notify_now = True
+                decision_reason = f"Within optimal {optimal_window}-minute window with {confidence:.1%} confidence"
+            else:
+                notify_now = False
+                suggested_delay = max(0, int(time_until_task - optimal_window))
+                decision_reason = f"Confidence ({confidence:.1%}) below threshold, waiting for better timing"
+        else:
+            # Too early - suggest delay
+            notify_now = False
+            suggested_delay = int(time_until_task - optimal_window)
+            decision_reason = f"Too early - {int(time_until_task)} minutes until task, optimal window is {optimal_window} minutes"
+    else:
+        # Flexible task: notify if confidence is high enough
+        if meets_threshold:
+            notify_now = True
+            decision_reason = f"Flexible task with {confidence:.1%} confidence (meets threshold)"
+        else:
+            notify_now = False
+            # For flexible tasks, suggest checking again at a better time
+            # Find the next best window
+            sorted_windows = sorted(all_windows, key=lambda x: x['confidence'], reverse=True)
+            next_best_window = sorted_windows[1] if len(sorted_windows) > 1 else sorted_windows[0]
+            suggested_delay = next_best_window['window']
+            decision_reason = f"Confidence ({confidence:.1%}) below threshold, try again in {suggested_delay} minutes"
+    
+    # Extract decision factors
+    context_parts = context_key.split('_')
+    decision_factors = {
+        'activity': context_parts[0] if len(context_parts) > 0 else 'unknown',
+        'time_of_day': context_parts[1] if len(context_parts) > 1 else 'unknown',
+        'day_type': context_parts[2] if len(context_parts) > 2 else 'unknown',
+        'location': context_parts[3] if len(context_parts) > 3 else 'unknown',
+        'evidence_strength': all_windows[0]['evidence_strength'] if all_windows else 0,
+        'priority': request.priority,
+        'task_type': 'fixed' if request.task_scheduled_time else 'flexible'
+    }
+    
+    # Build comprehensive explanation
+    explanation_parts = [decision_reason]
+    
+    # Add context description
+    explanation_parts.append(
+        f"Context: {decision_factors['activity'].lower()} on {decision_factors['day_type']} {decision_factors['time_of_day']} at {decision_factors['location']}"
+    )
+    
+    # Add evidence strength
+    if decision_factors['evidence_strength'] == 0:
+        explanation_parts.append("⚠️ No historical data - using uniform prior")
+    elif decision_factors['evidence_strength'] < 5:
+        explanation_parts.append(f"📊 Limited data ({decision_factors['evidence_strength']} samples)")
+    else:
+        explanation_parts.append(f"✓ Well-calibrated ({decision_factors['evidence_strength']} samples)")
+    
+    # Add priority consideration
+    if request.priority == 'high':
+        explanation_parts.append("🔴 High priority - bias toward notification")
+    
+    explanation = " • ".join(explanation_parts)
+    
+    # Simplify timing options for response
+    simplified_windows = [
+        {
+            'window': w['window'],
+            'confidence': w['confidence'],
+            'uncertainty': w['uncertainty'],
+            'evidence_strength': w['evidence_strength']
+        }
+        for w in all_windows
+    ]
+    
+    return NotificationDecisionResponse(
+        notify_now=notify_now,
+        confidence=confidence,
+        optimal_timing_window=optimal_window,
+        suggested_delay_minutes=suggested_delay,
+        explanation=explanation,
+        context_key=context_key,
+        all_timing_options=simplified_windows,
+        decision_factors=decision_factors
+    )
+
+
+# ===================== BAYESIAN LEARNING ENDPOINTS =====================
+
+@app.post("/learning/feedback")
+def submit_learning_feedback(
+    task_id: int,
+    task_type: str,
+    context: UserContextSchema,
+    timing_window: int,
+    feedback: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Enhanced feedback endpoint with Bayesian learning.
+    
+    Updates Beta distributions for timing optimization.
+    
+    Args:
+        task_id: ID of the task rule
+        task_type: Type of task
+        context: User's context when feedback was given
+        timing_window: Minutes before task the notification was sent
+        feedback: "accept" or "reject"
+    """
+    learning_service = LearningService(db)
+    
+    result = learning_service.record_feedback(
+        task_id=task_id,
+        task_type=task_type,
+        context=context,
+        timing_window=timing_window,
+        feedback=feedback
+    )
+    
+    if not result['success']:
+        raise HTTPException(status_code=400, detail=result.get('error', 'Feedback recording failed'))
+    
+    return result
+
+
+@app.get("/learning/summary")
+def get_learning_summary(
+    task_type: str = None,
+    context_key: str = None,
+    min_feedback_count: int = 0,
+    db: Session = Depends(get_db)
+):
+    """
+    Get summary of all learned Beta distributions.
+    
+    Query params:
+        task_type: Filter by specific task type
+        context_key: Filter by specific context
+        min_feedback_count: Minimum feedback samples to include
+    """
+    learning_service = LearningService(db)
+    
+    summary = learning_service.get_learning_summary(
+        task_type=task_type,
+        context_key=context_key,
+        min_feedback_count=min_feedback_count
+    )
+    
+    return summary
+
+
+@app.post("/learning/explanation")
+def get_learning_explanation(
+    task_type: str,
+    context: UserContextSchema,
+    db: Session = Depends(get_db)
+):
+    """
+    Get detailed explanation of learned behavior for a task in given context.
+    
+    Shows:
+    - What the system has learned
+    - Confidence levels for different timing windows
+    - How many feedback samples were collected
+    - Recommended timing window
+    """
+    learning_service = LearningService(db)
+    
+    explanation = learning_service.get_explanation_data(
+        task_type=task_type,
+        context=context
+    )
+    
+    return explanation
+
+
+@app.get("/learning/feedback-history")
+def get_learning_feedback_history(
+    task_id: int = None,
+    limit: int = 20,
+    db: Session = Depends(get_db)
+):
+    """
+    Get recent feedback history for analysis.
+    
+    Query params:
+        task_id: Filter by specific task
+        limit: Maximum number of records (default: 20)
+    """
+    learning_service = LearningService(db)
+    
+    history = learning_service.get_recent_feedback_history(
+        task_id=task_id,
+        limit=limit
+    )
+    
+    return {
+        "total": len(history),
+        "history": history
+    }
 
 
 if __name__ == "__main__":
