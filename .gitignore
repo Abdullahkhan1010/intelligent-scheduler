@@ -116,3 +116,6 @@ docs/_build/
 tmp/
 temp/
 *.tmp
+
+!flutter_app/lib/
+!flutter_app/lib/**
