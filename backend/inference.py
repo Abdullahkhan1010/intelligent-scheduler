@@ -12,6 +12,9 @@ from models import (
 import re
 import math
 
+# Import A* search algorithm for optimal task scheduling
+from search import TaskCandidate, TaskOption, optimize_schedule
+
 
 class BayesianTimingOptimizer:
     """
@@ -254,15 +257,17 @@ class BayesianTimingOptimizer:
 
 class InferenceEngine:
     """
-    Enhanced inference engine with Bayesian timing optimization.
+    Enhanced inference engine with Bayesian timing optimization and A* search.
     Evaluates task rules against context and determines optimal notification timing.
+    Now includes A* branch-and-bound search for globally optimal scheduling.
     """
     
     CONFIDENCE_THRESHOLD = 0.6
     
-    def __init__(self, db_session: Session):
+    def __init__(self, db_session: Session, enable_search: bool = True):
         self.db = db_session
         self.timing_optimizer = BayesianTimingOptimizer(db_session)
+        self.enable_search = enable_search  # Toggle A* search optimization
     
     def infer_tasks(self, context: UserContextSchema) -> List[InferredTask]:
         """
@@ -312,6 +317,15 @@ class InferenceEngine:
                             timing_result['explanation']
                         ]
                         
+                        # Collect all timing options for A* search
+                        timing_options = []
+                        for tw_option in timing_result['all_windows']:
+                            timing_options.append({
+                                'window': tw_option['window'],
+                                'confidence': tw_option['confidence'],
+                                'expected_reward': base_confidence * tw_option['confidence']
+                            })
+                        
                         task = InferredTask(
                             rule_id=rule.id,
                             task_name=rule.task_name,
@@ -320,7 +334,8 @@ class InferenceEngine:
                             reasoning=" | ".join(reasoning_parts),
                             matched_conditions=match_result["matched_conditions"],
                             optimal_timing_window=timing_result['timing_window'],
-                            timing_confidence=timing_result['confidence']
+                            timing_confidence=timing_result['confidence'],
+                            timing_options=timing_options  # Store all options for search
                         )
                         suggested_tasks.append(task)
         
@@ -328,11 +343,15 @@ class InferenceEngine:
         calendar_tasks = self._get_calendar_reminders(context)
         suggested_tasks.extend(calendar_tasks)
         
-        # Sort by combined confidence (rule confidence × timing confidence)
-        suggested_tasks.sort(
-            key=lambda x: x.confidence * (x.timing_confidence or 1.0), 
-            reverse=True
-        )
+        # Apply A* search optimization if enabled
+        if self.enable_search and len(suggested_tasks) > 1:
+            suggested_tasks = self._apply_search_optimization(suggested_tasks)
+        else:
+            # Fallback: Sort by combined confidence (rule confidence × timing confidence)
+            suggested_tasks.sort(
+                key=lambda x: x.confidence * (x.timing_confidence or 1.0), 
+                reverse=True
+            )
         
         return suggested_tasks
     
@@ -369,6 +388,25 @@ class InferenceEngine:
                     time_until = event.start_time - now
                     minutes_until = int(time_until.total_seconds() / 60)
                     
+                    # Create timing options for calendar events
+                    # Use standard timing windows relative to event time
+                    timing_options = []
+                    for window_mins in [60, 30, 15, 10]:
+                        if minutes_until >= window_mins:
+                            timing_options.append({
+                                'window': window_mins,
+                                'confidence': confidence * (1.0 - (window_mins / 120)),  # Prefer closer timings
+                                'expected_reward': confidence * (1.0 - (window_mins / 120))
+                            })
+                    
+                    # If no standard windows fit, use current time
+                    if not timing_options:
+                        timing_options = [{
+                            'window': minutes_until,
+                            'confidence': confidence,
+                            'expected_reward': confidence
+                        }]
+                    
                     task = InferredTask(
                         rule_id=rule.id,
                         task_name=event.title,
@@ -382,7 +420,8 @@ class InferenceEngine:
                             'start_time': event.start_time.isoformat()
                         },
                         optimal_timing_window=minutes_until,
-                        timing_confidence=confidence
+                        timing_confidence=confidence,
+                        timing_options=timing_options  # Add timing options for A* search
                     )
                     calendar_tasks.append(task)
         
@@ -527,6 +566,109 @@ class InferenceEngine:
         else:
             days = minutes / 1440
             return f"~{int(days)} days"
+    
+    def _apply_search_optimization(self, tasks: List[InferredTask]) -> List[InferredTask]:
+        """
+        Apply A* branch-and-bound search to find globally optimal task schedule.
+        
+        This method:
+        1. Converts InferredTask list to TaskCandidate list
+        2. Runs A* search to find optimal timing choices
+        3. Updates tasks with chosen timing windows
+        4. Adds search metadata to each task
+        5. Returns tasks sorted by expected reward
+        
+        Args:
+            tasks: List of inferred tasks with timing options
+            
+        Returns:
+            Optimized list of tasks with chosen timing windows and search metadata
+        """
+        try:
+            # Convert tasks to search candidates
+            candidates = []
+            for task in tasks:
+                if not task.timing_options or len(task.timing_options) == 0:
+                    # Task has no timing options (e.g., calendar event), use default
+                    options = [TaskOption(
+                        timing_window_minutes=task.optimal_timing_window or 30,
+                        expected_reward=task.confidence,
+                        context_match_score=1.0
+                    )]
+                else:
+                    # Convert timing options to TaskOption objects
+                    options = []
+                    for tw_opt in task.timing_options:
+                        options.append(TaskOption(
+                            timing_window_minutes=tw_opt['window'],
+                            expected_reward=tw_opt['expected_reward'],
+                            context_match_score=tw_opt.get('confidence', 1.0)
+                        ))
+                
+                candidates.append(TaskCandidate(
+                    task_id=task.rule_id,
+                    title=task.task_name,
+                    priority_weight=task.confidence,
+                    options=options
+                ))
+            
+            # Run A* search optimization
+            search_result = optimize_schedule(
+                candidates=candidates,
+                max_nodes=10000,
+                enable_pruning=True
+            )
+            
+            # Create a map of task_id -> chosen timing window
+            chosen_timings = {task_id: window for task_id, window in search_result.schedule}
+            
+            # Update tasks with search results
+            updated_tasks = []
+            for task in tasks:
+                # Get chosen timing for this task
+                chosen_window = chosen_timings.get(task.rule_id)
+                
+                if chosen_window is not None:
+                    # Update the task with chosen timing
+                    task.optimal_timing_window = chosen_window
+                    
+                    # Find the confidence for this chosen window
+                    if task.timing_options:
+                        for tw_opt in task.timing_options:
+                            if tw_opt['window'] == chosen_window:
+                                task.timing_confidence = tw_opt.get('confidence', task.timing_confidence)
+                                break
+                    
+                    # Add search metadata
+                    task.search_metadata = {
+                        'search_algorithm': 'A* branch-and-bound',
+                        'total_expected_reward': round(search_result.total_expected_reward, 3),
+                        'nodes_explored': search_result.nodes_explored,
+                        'search_completed': search_result.search_completed,
+                        'search_time_ms': round(search_result.search_time_ms, 2),
+                        'optimization_quality': 'optimal' if search_result.search_completed else 'greedy_fallback',
+                        'chosen_timing_window': chosen_window
+                    }
+                    
+                    updated_tasks.append(task)
+                # If chosen_window is None, task was skipped by search (low priority)
+            
+            # Sort by expected reward (confidence × timing_confidence)
+            updated_tasks.sort(
+                key=lambda x: x.confidence * (x.timing_confidence or 1.0),
+                reverse=True
+            )
+            
+            return updated_tasks
+            
+        except Exception as e:
+            # Fallback: If search fails, return tasks with original ordering
+            print(f"⚠️  A* search failed: {e}. Falling back to greedy sorting.")
+            tasks.sort(
+                key=lambda x: x.confidence * (x.timing_confidence or 1.0),
+                reverse=True
+            )
+            return tasks
     
     def _extract_scheduled_time(self, trigger_condition: dict) -> Optional[datetime]:
         """Extract scheduled time from trigger condition if it exists"""

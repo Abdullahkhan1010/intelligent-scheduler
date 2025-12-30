@@ -259,6 +259,8 @@ class InferredTask(BaseModel):
     matched_conditions: Dict[str, Any]
     optimal_timing_window: Optional[int] = None  # Minutes before task
     timing_confidence: Optional[float] = None  # Bayesian confidence for timing
+    timing_options: Optional[List[Dict[str, Any]]] = None  # All timing options for A* search
+    search_metadata: Optional[Dict[str, Any]] = None  # A* search optimization metadata
 
 
 class InferenceResponse(BaseModel):
