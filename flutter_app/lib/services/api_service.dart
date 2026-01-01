@@ -7,7 +7,7 @@ class ApiService {
   // For Android emulator use: 10.0.2.2:8000
   // For real phone on same WiFi use your Mac's IP: 192.168.209.106:8000
   // Current Mac IP detected: 192.168.209.106
-  static const String baseUrl = 'http://192.168.209.106:8000';
+  static const String baseUrl = 'https://intelligent-scheduler-backend.onrender.com';
   
   final http.Client _client = http.Client();
 
