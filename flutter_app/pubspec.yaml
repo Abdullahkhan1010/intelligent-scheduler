@@ -34,6 +34,12 @@ dependencies:
   
   # Background execution for continuous notifications
   workmanager: ^0.9.0
+  
+  # Real Sensors for Physical Devices
+  geolocator: ^11.0.0
+  permission_handler: ^11.3.0
+  network_info_plus: ^5.0.0
+  flutter_blue_plus: ^1.31.0
 
 dev_dependencies:
   flutter_test:

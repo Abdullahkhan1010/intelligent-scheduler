@@ -932,7 +932,6 @@ class _HomeViewState extends ConsumerState<HomeView> {
     final description = rule['task_description'] as String?;
     final confidence = (rule['current_probability_weight'] as num).toDouble();
     final triggerCondition = rule['trigger_condition'] as Map<String, dynamic>?;
-    final ruleId = rule['id'] as int;
 
     showDialog(
       context: context,

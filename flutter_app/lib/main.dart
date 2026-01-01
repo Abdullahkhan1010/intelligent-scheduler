@@ -6,7 +6,6 @@ import 'views/chat_view.dart';
 import 'services/notification_service.dart';
 import 'services/feedback_tracker.dart';
 import 'services/sensor_service.dart';
-import 'services/background_service.dart';
 import 'package:flutter/services.dart';
 
 void main() async {

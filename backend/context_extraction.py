@@ -195,12 +195,14 @@ class ContextExtractor:
         hour = timestamp.hour
         minute = timestamp.minute
         
-        # Activity and mobility
+        # Activity and mobility - PRIORITIZE SPEED DATA
         raw_activity = raw_data.get('activity_type', 'STILL')
-        activity_state = self._extract_activity_state(raw_activity)
         speed_kmh = float(raw_data.get('speed', 0.0))
         is_moving = speed_kmh > 1.0
         is_stationary = speed_kmh <= 1.0
+        
+        # Extract activity state with speed override
+        activity_state = self._extract_activity_state(raw_activity, speed_kmh)
         
         # WiFi analysis (soft signals)
         wifi_ssid = raw_data.get('wifi_ssid')
@@ -296,8 +298,34 @@ class ContextExtractor:
         else:
             return TimeOfDay.NIGHT
     
-    def _extract_activity_state(self, raw_activity: str) -> ActivityState:
-        """Convert raw activity type to normalized activity state"""
+    def _extract_activity_state(self, raw_activity: str, speed_kmh: float) -> ActivityState:
+        """
+        Convert raw activity type to normalized activity state.
+        CRITICAL: Speed data overrides raw activity type labels.
+        """
+        # PRIORITY 1: Use real speed data to determine actual activity
+        if speed_kmh <= 1.0:
+            # Definitely stationary, regardless of what activity_type says
+            return ActivityState.STATIONARY
+        elif speed_kmh > 1.0 and speed_kmh <= 5.0:
+            # Low speed - walking
+            return ActivityState.WALKING
+        elif speed_kmh > 5.0 and speed_kmh <= 15.0:
+            # Medium speed - could be running or cycling
+            activity_upper = raw_activity.upper()
+            if 'RUNNING' in activity_upper:
+                return ActivityState.RUNNING
+            elif 'CYCLING' in activity_upper or 'BICYCLE' in activity_upper:
+                return ActivityState.CYCLING
+            else:
+                # Default to walking for medium speeds
+                return ActivityState.WALKING
+        else:  # speed_kmh > 15.0
+            # High speed - definitely in a vehicle
+            return ActivityState.TRAVELING
+        
+        # FALLBACK (should rarely be used): Parse raw activity type
+        # This is only reached if speed data is missing or unreliable
         activity_upper = raw_activity.upper()
         
         if activity_upper in ['STILL', 'STATIONARY']:
@@ -375,8 +403,49 @@ class ContextExtractor:
         """
         Infer location category from multiple signals.
         Uses a confidence-based approach with multiple data sources.
+        PRIORITY: Real speed data overrides all other signals.
         """
-        # Priority 1: Use explicit location_vector if provided
+        # Priority 0: ALWAYS check real speed first - this overrides everything
+        # If speed is near zero, user is definitely stationary regardless of other signals
+        if speed_kmh <= 1.0:
+            # User is stationary - check WiFi to determine where
+            if wifi_analysis['is_home']:
+                return LocationCategory.HOME, 'home'
+            elif wifi_analysis['is_campus']:
+                return LocationCategory.CAMPUS, 'campus'
+            elif wifi_analysis['is_work']:
+                return LocationCategory.WORK, 'work'
+            # If stationary with explicit location, use it
+            elif raw_location:
+                location_lower = raw_location.lower()
+                if 'home' in location_lower:
+                    return LocationCategory.HOME, raw_location
+                elif 'campus' in location_lower or 'university' in location_lower:
+                    return LocationCategory.CAMPUS, raw_location
+                elif 'work' in location_lower or 'office' in location_lower:
+                    return LocationCategory.WORK, raw_location
+            # Stationary but unknown location
+            return LocationCategory.UNKNOWN, 'stationary'
+        
+        # Priority 1: If speed > 1 km/h, user is moving
+        # Check if they're actually traveling (speed > 10 km/h indicates vehicle)
+        if speed_kmh > 10.0:
+            # Definitely in a vehicle / traveling
+            return LocationCategory.COMMUTE, 'commute'
+        elif speed_kmh > 1.0 and speed_kmh <= 10.0:
+            # Low speed movement - likely walking
+            # Could be walking at home, campus, or commuting
+            if wifi_analysis['is_home']:
+                return LocationCategory.HOME, 'home'
+            elif wifi_analysis['is_campus']:
+                return LocationCategory.CAMPUS, 'campus'
+            elif wifi_analysis['is_work']:
+                return LocationCategory.WORK, 'work'
+            else:
+                # Walking but unknown location
+                return LocationCategory.UNKNOWN, 'walking'
+        
+        # Priority 2: Use explicit location_vector if provided (but speed is still zero)
         if raw_location:
             location_lower = raw_location.lower()
             if 'home' in location_lower:
@@ -386,9 +455,14 @@ class ContextExtractor:
             elif 'work' in location_lower or 'office' in location_lower:
                 return LocationCategory.WORK, raw_location
             elif 'leaving' in location_lower or 'commute' in location_lower:
-                return LocationCategory.COMMUTE, raw_location
+                # Only use commute from raw_location if speed indicates movement
+                if speed_kmh > 5.0:
+                    return LocationCategory.COMMUTE, raw_location
+                else:
+                    # Ignore commute label if not actually moving
+                    return LocationCategory.UNKNOWN, 'stationary_mislabeled'
         
-        # Priority 2: WiFi-based inference
+        # Priority 3: WiFi-based inference (fallback when speed is unavailable/zero)
         if wifi_analysis['is_home']:
             return LocationCategory.HOME, 'home'
         elif wifi_analysis['is_campus']:
@@ -396,16 +470,7 @@ class ContextExtractor:
         elif wifi_analysis['is_work']:
             return LocationCategory.WORK, 'work'
         
-        # Priority 3: Activity and speed-based inference
-        if activity_state == ActivityState.TRAVELING or is_car_connected:
-            if speed_kmh > 20:  # Likely on highway/commute
-                return LocationCategory.COMMUTE, 'commute'
-        
-        if activity_state == ActivityState.STATIONARY and speed_kmh < 1:
-            # Stationary without WiFi - could be anywhere
-            return LocationCategory.UNKNOWN, 'unknown_stationary'
-        
-        # Default
+        # Default - unknown location
         return LocationCategory.UNKNOWN, None
     
     def _extract_calendar_availability(self, raw_data: Dict[str, Any]) -> CalendarAvailability:
